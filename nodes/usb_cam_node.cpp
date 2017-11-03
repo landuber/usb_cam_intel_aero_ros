@@ -35,13 +35,24 @@
 *********************************************************************/
 
 #include <ros/ros.h>
+#include <camera.h>
 #include <usb_cam/usb_cam.h>
 #include <image_transport/image_transport.h>
+#include <sensor_msgs/fill_image.h>
 #include <camera_info_manager/camera_info_manager.h>
 #include <sstream>
 #include <std_srvs/Empty.h>
 
+#define DEFAULT_PIXEL_FORMAT V4L2_PIX_FMT_YUV420
+
 namespace usb_cam {
+
+static void camera_callback_(const void *img, size_t len, const struct timeval *timestamp, void *data)
+{
+    UsbCamNode *node = (UsbCamNode *)data;
+    data->camera_callback(img, len, timestamp);
+
+}
 
 class UsbCamNode
 {
@@ -57,11 +68,12 @@ public:
   std::string video_device_name_, io_method_name_, pixel_format_name_, camera_name_, camera_info_url_;
   //std::string start_service_name_, start_service_name_;
   bool streaming_status_;
-  int image_width_, image_height_, framerate_, exposure_, brightness_, contrast_, saturation_, sharpness_, focus_,
+  int device_id, image_width_, image_height_, framerate_, exposure_, brightness_, contrast_, saturation_, sharpness_, focus_,
       white_balance_, gain_;
   bool autofocus_, autoexposure_, auto_white_balance_;
   boost::shared_ptr<camera_info_manager::CameraInfoManager> cinfo_;
 
+  Camera * camera_;
   UsbCam cam_;
 
   ros::ServiceServer service_start_, service_stop_;
@@ -70,14 +82,14 @@ public:
 
   bool service_start_cap(std_srvs::Empty::Request  &req, std_srvs::Empty::Response &res )
   {
-    cam_.start_capturing();
+    camera_->restart();
     return true;
   }
 
 
   bool service_stop_cap( std_srvs::Empty::Request  &req, std_srvs::Empty::Response &res )
   {
-    cam_.stop_capturing();
+    camera_->stop();
     return true;
   }
 
@@ -90,6 +102,7 @@ public:
 
     // grab the parameters
     node_.param("video_device", video_device_name_, std::string("/dev/video0"));
+    node_.param("device_id", device_id, 0); 
     node_.param("brightness", brightness_, -1); //0-255, -1 "leave alone"
     node_.param("contrast", contrast_, -1); //0-255, -1 "leave alone"
     node_.param("saturation", saturation_, -1); //0-255, -1 "leave alone"
@@ -137,100 +150,33 @@ public:
     ROS_INFO("Starting '%s' (%s) at %dx%d via %s (%s) at %i FPS", camera_name_.c_str(), video_device_name_.c_str(),
         image_width_, image_height_, io_method_name_.c_str(), pixel_format_name_.c_str(), framerate_);
 
-    // set the IO method
-    UsbCam::io_method io_method = UsbCam::io_method_from_string(io_method_name_);
-    if(io_method == UsbCam::IO_METHOD_UNKNOWN)
-    {
-      ROS_FATAL("Unknown IO method '%s'", io_method_name_.c_str());
-      node_.shutdown();
-      return;
+    // New camera
+    camera_ = new Camera(video_device_name_);
+    if(camera_->init(device_id, image_width_, image_height_, DEFAULT_PIXEL_FORMAT)){
+        ROS_FATAL("Unable to initialize camera");
+        node_.shutdown();
+        return;
     }
 
-    // set the pixel format
-    UsbCam::pixel_format pixel_format = UsbCam::pixel_format_from_string(pixel_format_name_);
-    if (pixel_format == UsbCam::PIXEL_FORMAT_UNKNOWN)
-    {
-      ROS_FATAL("Unknown pixel format '%s'", pixel_format_name_.c_str());
-      node_.shutdown();
-      return;
-    }
+    camera_->callback_set(camera_callback_, this);
 
-    // start the camera
-    cam_.start(video_device_name_.c_str(), io_method, pixel_format, image_width_,
-		     image_height_, framerate_);
-
-    // set camera parameters
-    if (brightness_ >= 0)
-    {
-      cam_.set_v4l_parameter("brightness", brightness_);
-    }
-
-    if (contrast_ >= 0)
-    {
-      cam_.set_v4l_parameter("contrast", contrast_);
-    }
-
-    if (saturation_ >= 0)
-    {
-      cam_.set_v4l_parameter("saturation", saturation_);
-    }
-
-    if (sharpness_ >= 0)
-    {
-      cam_.set_v4l_parameter("sharpness", sharpness_);
-    }
-
-    if (gain_ >= 0)
-    {
-      cam_.set_v4l_parameter("gain", gain_);
-    }
-
-    // check auto white balance
-    if (auto_white_balance_)
-    {
-      cam_.set_v4l_parameter("white_balance_temperature_auto", 1);
-    }
-    else
-    {
-      cam_.set_v4l_parameter("white_balance_temperature_auto", 0);
-      cam_.set_v4l_parameter("white_balance_temperature", white_balance_);
-    }
-
-    // check auto exposure
-    if (!autoexposure_)
-    {
-      // turn down exposure control (from max of 3)
-      cam_.set_v4l_parameter("exposure_auto", 1);
-      // change the exposure level
-      cam_.set_v4l_parameter("exposure_absolute", exposure_);
-    }
-
-    // check auto focus
-    if (autofocus_)
-    {
-      cam_.set_auto_focus(1);
-      cam_.set_v4l_parameter("focus_auto", 1);
-    }
-    else
-    {
-      cam_.set_v4l_parameter("focus_auto", 0);
-      if (focus_ >= 0)
-      {
-        cam_.set_v4l_parameter("focus_absolute", focus_);
-      }
+    if(camera_->start()) {
+        ROS_FATAL("Unable to start camera streaming");
+        node_.shutdown();
+        return;
     }
   }
 
-  virtual ~UsbCamNode()
+  void camera_callback(const void *img, UNUSED size_t len, const struct timeval *timestamp)
   {
-    cam_.shutdown();
+    uchar *image = (uchar*)img;
+    // todo: make this flexible for the color case
+    fillImage(&img_, "mono8", image_height_, image_width_, image_width_, image);
+
   }
 
-  bool take_and_send_image()
+  bool send_image()
   {
-    // grab the image
-    cam_.grab_image(&img_);
-
     // grab the camera info
     sensor_msgs::CameraInfoPtr ci(new sensor_msgs::CameraInfo(cinfo_->getCameraInfo()));
     ci->header.frame_id = img_.header.frame_id;
@@ -242,14 +188,17 @@ public:
     return true;
   }
 
+  virtual ~UsbCamNode()
+  {
+    camera_->shutdown();
+  }
+
   bool spin()
   {
     ros::Rate loop_rate(this->framerate_);
     while (node_.ok())
     {
-      if (cam_.is_capturing()) {
-        if (!take_and_send_image()) ROS_WARN("USB camera did not respond in time.");
-      }
+      if (!send_image()) ROS_WARN("USB camera did not respond in time.");
       ros::spinOnce();
       loop_rate.sleep();
 
