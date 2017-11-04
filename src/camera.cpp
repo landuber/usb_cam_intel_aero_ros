@@ -261,6 +261,7 @@ int Camera::init(int id, uint32_t w, uint32_t h, uint32_t pf)
 #endif
 
 	/* if restarting set the previous exposure value */
+        /*
 	if (_exposure_value != 0) {
 		exposure_set(_exposure_value);
 	} else {
@@ -277,8 +278,10 @@ int Camera::init(int id, uint32_t w, uint32_t h, uint32_t pf)
 		_exposure_value = ctrl.value;
 		DEBUG("Initial exposure %u", _exposure_value);
 	}
+        */
 
 	/* if restarting set the previous gain value */
+        /*
 	if (_gain_value != 0) {
 		gain_set(_gain_value);
 	} else {
@@ -295,6 +298,7 @@ int Camera::init(int id, uint32_t w, uint32_t h, uint32_t pf)
 		_gain_value = ctrl.value;
 		DEBUG("Initial gain %u", _gain_value);
 	}
+        */
 
 	ret = _backend_user_ptr_streaming_init(fmt.fmt.pix.sizeimage);
 	if (ret) {

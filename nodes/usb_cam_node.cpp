@@ -34,25 +34,38 @@
 *
 *********************************************************************/
 
+#include <string>
+#include <pthread.h>
+#include <poll.h>
+#include <signal.h>
 #include <ros/ros.h>
 #include <camera.h>
-#include <usb_cam/usb_cam.h>
 #include <image_transport/image_transport.h>
 #include <sensor_msgs/fill_image.h>
 #include <camera_info_manager/camera_info_manager.h>
 #include <sstream>
 #include <std_srvs/Empty.h>
+#include <linux/videodev2.h>
+#include <opencv2/opencv.hpp>
 
+
+
+#define POLL_ERROR_EVENTS (POLLERR | POLLHUP | POLLNVAL)
+
+#define CAMERA_MSEC_TIMEOUT 10000
 #define DEFAULT_PIXEL_FORMAT V4L2_PIX_FMT_YUV420
+#define UNUSED __attribute__((__unused__))
+
+using namespace cv;
+
+typedef unsigned char uchar;
+
+static volatile bool _should_run;
+
+
 
 namespace usb_cam {
 
-static void camera_callback_(const void *img, size_t len, const struct timeval *timestamp, void *data)
-{
-    UsbCamNode *node = (UsbCamNode *)data;
-    data->camera_callback(img, len, timestamp);
-
-}
 
 class UsbCamNode
 {
@@ -74,28 +87,43 @@ public:
   boost::shared_ptr<camera_info_manager::CameraInfoManager> cinfo_;
 
   Camera * camera_;
-  UsbCam cam_;
+  pthread_mutex_t node_lock_;
 
   ros::ServiceServer service_start_, service_stop_;
+  UsbCamNode();
+  ~UsbCamNode();
+
+  bool service_start_cap(std_srvs::Empty::Request  &req, std_srvs::Empty::Response &res );
+  bool service_stop_cap( std_srvs::Empty::Request  &req, std_srvs::Empty::Response &res );
+  void camera_callback(const void *img, UNUSED size_t len, const struct timeval *timestamp);
+  void *camera_thread();
+  void _signal_handlers_setup(void);
+  bool send_image();
+  void init_camera();
+  void run();
+  bool spin();
+};
+
+static void camera_callback_(const void *img, size_t len, const struct timeval *timestamp, void *data)
+{
+    UsbCamNode *node = (UsbCamNode *)data;
+    node->camera_callback(img, len, timestamp);
+}
+
+static void *thread_callback_(void *data)
+{
+    UsbCamNode *node = (UsbCamNode *) data;
+    return node->camera_thread();
+}
+
+static void exit_signal_handler(UNUSED int signum)
+{
+    _should_run = false;
+}
 
 
-
-  bool service_start_cap(std_srvs::Empty::Request  &req, std_srvs::Empty::Response &res )
-  {
-    camera_->restart();
-    return true;
-  }
-
-
-  bool service_stop_cap( std_srvs::Empty::Request  &req, std_srvs::Empty::Response &res )
-  {
-    camera_->stop();
-    return true;
-  }
-
-  UsbCamNode() :
-      node_("~")
-  {
+UsbCamNode::UsbCamNode() : node_("~")
+{
     // advertise the main image topic
     image_transport::ImageTransport it(node_);
     image_pub_ = it.advertiseCamera("image_raw", 1);
@@ -150,14 +178,30 @@ public:
     ROS_INFO("Starting '%s' (%s) at %dx%d via %s (%s) at %i FPS", camera_name_.c_str(), video_device_name_.c_str(),
         image_width_, image_height_, io_method_name_.c_str(), pixel_format_name_.c_str(), framerate_);
 
+
+
+
+}
+
+void UsbCamNode::init_camera()
+{
     // New camera
-    camera_ = new Camera(video_device_name_);
+    camera_ = new Camera(video_device_name_.c_str());
+    if(!camera_) {
+	ROS_FATAL("No memory to allocate Camera");
+        node_.shutdown();
+        return;
+    }
+
     if(camera_->init(device_id, image_width_, image_height_, DEFAULT_PIXEL_FORMAT)){
         ROS_FATAL("Unable to initialize camera");
         node_.shutdown();
         return;
     }
+}
 
+void UsbCamNode::run()
+{
     camera_->callback_set(camera_callback_, this);
 
     if(camera_->start()) {
@@ -165,35 +209,124 @@ public:
         node_.shutdown();
         return;
     }
-  }
 
-  void camera_callback(const void *img, UNUSED size_t len, const struct timeval *timestamp)
+    _signal_handlers_setup();
+    _should_run = true;
+    // synchronization
+    pthread_mutex_init(&node_lock_, NULL);
+    pthread_t thread;
+    if(pthread_create(&thread, NULL, thread_callback_, this)) {
+	ROS_FATAL("Unable to create a thread");
+        node_.shutdown();
+	return;
+    }
+}
+
+void * UsbCamNode::camera_thread()
+{
+	Pollable *pollables[] = { camera_ };
+	const uint8_t len = sizeof(pollables) / sizeof(Pollable *);
+	struct pollfd desc[len];
+
+	for (uint8_t i = 0; i < len; i++) {
+		desc[i].fd = pollables[i]->_fd;
+		desc[i].events = POLLIN | POLLPRI | POLL_ERROR_EVENTS;
+		desc[i].revents = 0;
+	}
+
+	while (_should_run) {
+		//int ret = poll(desc, sizeof(desc) / sizeof(struct pollfd), CAMERA_MSEC_TIMEOUT);
+		int ret = poll(desc, sizeof(desc) / sizeof(struct pollfd), -1);
+		if (ret == 0) {
+			ROS_INFO("Camera timeout, restarting...");
+ 			//camera_->handle_read();
+			camera_->restart();
+			continue;
+		}
+		if (ret < 1) {
+			continue;
+		}
+
+		for (unsigned i = 0; ret && i < (sizeof(desc) / sizeof(struct pollfd)); i++, ret--) {
+			for (uint8_t j = 0; j < len; j++) {
+				if (desc[i].fd == pollables[j]->_fd) {
+					if (desc[i].revents & (POLLIN | POLLPRI)) {
+						pollables[j]->handle_read();
+					}
+					if (desc[i].revents & POLLOUT) {
+						pollables[j]->handle_canwrite();
+					}
+					if (desc[i].revents & POLL_ERROR_EVENTS) {
+						ROS_FATAL("Poll error event on camera: %u", desc[i].revents);
+					}
+					break;
+				}
+			}
+		}
+	}
+
+	return NULL;
+}
+
+void UsbCamNode::_signal_handlers_setup(void)
+{
+    struct sigaction sa = { };
+
+    sa.sa_flags = SA_NOCLDSTOP;
+    sa.sa_handler = exit_signal_handler;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sa, NULL);
+}
+
+
+bool UsbCamNode::service_start_cap(std_srvs::Empty::Request  &req, std_srvs::Empty::Response &res )
+{
+   camera_->restart();
+   return true;
+}
+
+
+bool UsbCamNode::service_stop_cap( std_srvs::Empty::Request  &req, std_srvs::Empty::Response &res )
+{
+    camera_->stop();
+    return true;
+}
+
+
+  void UsbCamNode::camera_callback(const void *img, UNUSED size_t len, const struct timeval *timestamp)
   {
     uchar *image = (uchar*)img;
     // todo: make this flexible for the color case
-    fillImage(&img_, "mono8", image_height_, image_width_, image_width_, image);
+    pthread_mutex_lock(&node_lock_);
+    fillImage(img_, "mono8", image_height_, image_width_, image_width_, image);
+    pthread_mutex_unlock(&node_lock_);
 
   }
 
-  bool send_image()
+  bool UsbCamNode::send_image()
   {
     // grab the camera info
     sensor_msgs::CameraInfoPtr ci(new sensor_msgs::CameraInfo(cinfo_->getCameraInfo()));
+    pthread_mutex_lock(&node_lock_);
     ci->header.frame_id = img_.header.frame_id;
     ci->header.stamp = img_.header.stamp;
 
     // publish the image
     image_pub_.publish(img_, *ci);
+    pthread_mutex_unlock(&node_lock_);
 
     return true;
   }
 
-  virtual ~UsbCamNode()
+  UsbCamNode::~UsbCamNode()
   {
     camera_->shutdown();
   }
 
-  bool spin()
+  bool UsbCamNode::spin()
   {
     ros::Rate loop_rate(this->framerate_);
     while (node_.ok())
@@ -206,19 +339,14 @@ public:
     return true;
   }
 
-
-
-
-
-
-};
-
 }
 
 int main(int argc, char **argv)
 {
   ros::init(argc, argv, "usb_cam");
   usb_cam::UsbCamNode a;
+  a.init_camera();
+  a.run();
   a.spin();
   return EXIT_SUCCESS;
 }
